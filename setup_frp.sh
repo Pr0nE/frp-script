@@ -244,6 +244,174 @@ check_status() {
     fi
 }
 
+# Apply Ubuntu optimizations for FRP
+optimize_ubuntu() {
+    print_info "Applying Ubuntu optimizations for FRP..."
+    
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        print_warn "Some optimizations require root privileges. Run as root for full optimization."
+    fi
+    
+    local applied=0
+    
+    # 1. Increase file descriptor limits
+    print_info "Setting file descriptor limits..."
+    if [[ $EUID -eq 0 ]]; then
+        # System-wide limits
+        if ! grep -q "* soft nofile" /etc/security/limits.conf; then
+            echo "* soft nofile 65535" >> /etc/security/limits.conf
+            echo "* hard nofile 65535" >> /etc/security/limits.conf
+            applied=$((applied + 1))
+            print_info "✓ File descriptor limits set to 65535"
+        else
+            print_info "✓ File descriptor limits already configured"
+        fi
+    fi
+    
+    # Current session limits
+    ulimit -n 65535 2>/dev/null && print_info "✓ Session file descriptor limit set"
+    
+    # 2. TCP optimizations
+    if [[ $EUID -eq 0 ]]; then
+        print_info "Applying TCP optimizations..."
+        
+        cat > /etc/sysctl.d/99-frp-optimization.conf << 'EOF'
+# FRP TCP optimizations
+net.core.rmem_default = 262144
+net.core.rmem_max = 16777216
+net.core.wmem_default = 262144
+net.core.wmem_max = 16777216
+net.core.netdev_max_backlog = 5000
+net.core.somaxconn = 65535
+net.ipv4.tcp_rmem = 4096 65536 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_timestamps = 0
+EOF
+        
+        sysctl -p /etc/sysctl.d/99-frp-optimization.conf >/dev/null 2>&1
+        applied=$((applied + 1))
+        print_info "✓ TCP optimizations applied"
+    fi
+    
+    # 3. Create FRP systemd service
+    if [[ $EUID -eq 0 ]]; then
+        print_info "Creating systemd services..."
+        
+        # FRP Server service
+        cat > /etc/systemd/system/frps.service << EOF
+[Unit]
+Description=FRP Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+ExecStart=$(pwd)/frps -c $(pwd)/frps.toml
+ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=process
+Delegate=yes
+LimitNOFILE=65535
+LimitNPROC=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        
+        # FRP Client service
+        cat > /etc/systemd/system/frpc.service << EOF
+[Unit]
+Description=FRP Client
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+ExecStart=$(pwd)/frpc -c $(pwd)/frpc.toml
+ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=process
+Delegate=yes
+LimitNOFILE=65535
+LimitNPROC=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        
+        systemctl daemon-reload
+        applied=$((applied + 1))
+        print_info "✓ Systemd services created (frps.service, frpc.service)"
+        print_info "  Use: systemctl enable frps && systemctl start frps"
+        print_info "  Use: systemctl enable frpc && systemctl start frpc"
+    fi
+    
+    # 4. Install useful network tools
+    if [[ $EUID -eq 0 ]] && command -v apt-get >/dev/null; then
+        print_info "Installing network monitoring tools..."
+        apt-get update >/dev/null 2>&1
+        apt-get install -y htop iftop nethogs ss curl wget >/dev/null 2>&1
+        applied=$((applied + 1))
+        print_info "✓ Network tools installed (htop, iftop, nethogs, ss)"
+    fi
+    
+    # 5. Configure log rotation
+    if [[ $EUID -eq 0 ]]; then
+        print_info "Setting up log rotation..."
+        
+        cat > /etc/logrotate.d/frp << 'EOF'
+/root/frp/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    maxsize 100M
+}
+EOF
+        applied=$((applied + 1))
+        print_info "✓ Log rotation configured"
+    fi
+    
+    # 6. Set timezone and NTP
+    if [[ $EUID -eq 0 ]]; then
+        print_info "Configuring time synchronization..."
+        timedatectl set-ntp true >/dev/null 2>&1
+        applied=$((applied + 1))
+        print_info "✓ NTP synchronization enabled"
+    fi
+    
+    # 7. Firewall recommendations
+    print_info "Firewall recommendations:"
+    print_info "  Server: ufw allow 7000,7500,8080/tcp"
+    print_info "  Client: No firewall changes needed"
+    
+    echo
+    print_info "Applied $applied optimizations"
+    print_warn "Reboot recommended for all optimizations to take effect"
+    
+    if [[ $applied -eq 0 ]]; then
+        print_warn "Run as root (sudo) to apply system-level optimizations"
+    fi
+}
+
 # Main menu
 main() {
     print_info "=== FRP Simple Setup Script ==="
@@ -262,7 +430,8 @@ main() {
     echo "2) Client mode"
     echo "3) Stop running FRP processes"
     echo "4) Check FRP status"
-    read -p "Enter choice (1-4): " mode_choice
+    echo "5) Optimize Ubuntu for FRP"
+    read -p "Enter choice (1-5): " mode_choice
     
     case $mode_choice in
         1)
@@ -362,6 +531,11 @@ main() {
         4)
             print_info "Checking FRP status..."
             check_status
+            ;;
+            
+        5)
+            print_info "Optimizing Ubuntu for FRP..."
+            optimize_ubuntu
             ;;
             
         *)
