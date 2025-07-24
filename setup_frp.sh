@@ -181,6 +181,16 @@ stop_frp() {
         rm -f frpc.pid
     fi
     
+    # Also stop any other frps/frpc processes that might be running
+    local other_pids=$(pgrep -f "frps\|frpc" 2>/dev/null || true)
+    if [[ -n "$other_pids" ]]; then
+        echo "$other_pids" | while read pid; do
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null && print_info "Stopped additional FRP process (PID: $pid)" && stopped=true
+            fi
+        done
+    fi
+    
     if [[ "$stopped" == false ]]; then
         print_warn "No running FRP processes found"
     fi
